@@ -1,60 +1,108 @@
+import heapq
 import json
 import math
 import re
+import sys
 import unicodedata
 import zipfile
 from collections import Counter, defaultdict
-from difflib import SequenceMatcher
+from pathlib import Path
 
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
+from pyvi import ViTokenizer
 
 
 # ============================================================
-# 1. TEXT PREPROCESSING
+# CẤU HÌNH
+# ============================================================
+
+CORPUS_FILE = "/content/dataset.json"
+TEST_FILE = "/content/de_thi.json"
+
+OUTPUT_FILE = "submission.json"
+ZIP_FILE = "submission.zip"
+
+# Mỗi passage gồm 3 câu, cửa sổ trượt 2 câu.
+PASSAGE_SIZE = 3
+PASSAGE_STRIDE = 2
+
+# Số passage lấy từ câu hỏi gốc.
+QUESTION_TOP_K = 25
+
+# Số passage lấy từ question + từng đáp án.
+CHOICE_TOP_K = 12
+
+# Tham số BM25.
+BM25_K1 = 1.5
+BM25_B = 0.75
+
+# Tiêu đề quan trọng hơn content.
+# Lặp title là cách đơn giản để tăng trọng số mà không cần BM25F phức tạp.
+TITLE_REPEAT = 2
+
+
+# ============================================================
+# 1. CHUẨN HÓA VÀ TÁCH TỪ TIẾNG VIỆT
 # ============================================================
 
 def normalize_text(text):
     """
     Chuẩn hóa văn bản:
-    - chuyển về chữ thường
-    - chuẩn hóa Unicode
-    - loại bỏ ký tự thừa
-    - giữ lại chữ cái, chữ số và dấu tiếng Việt
+    - Unicode NFC
+    - chữ thường
+    - bỏ dấu câu không cần thiết
+    - giữ dấu gạch dưới do PyVi sinh ra
     """
     text = str(text or "")
     text = unicodedata.normalize("NFC", text.lower())
-    text = re.sub(r"[_]+", " ", text)
+
+    # Giữ lại chữ, số và underscore.
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
+
     return text
 
 
 def tokenize(text):
-    """Tokenize đơn giản, phù hợp với phương pháp cổ điển."""
-    return re.findall(r"\w+", normalize_text(text), flags=re.UNICODE)
+    """
+    Tách từ tiếng Việt bằng PyVi.
+
+    Ví dụ:
+    "công nghệ thông tin"
+    → ["công_nghệ", "thông_tin"]
+    """
+    text = normalize_text(text)
+
+    if not text:
+        return []
+
+    segmented_text = ViTokenizer.tokenize(text)
+
+    return segmented_text.split()
 
 
 def split_sentences(text):
     """
-    Chia văn bản thành câu hoặc đoạn ngắn.
-    Có xử lý cả xuống dòng và dấu câu.
+    Chia content thành các câu ngắn.
+    Tránh passage quá dài làm loãng kết quả retrieval.
     """
     text = str(text or "").strip()
+
     if not text:
         return []
 
     sentences = re.split(r"(?<=[.!?;:])\s+|\n+", text)
-    sentences = [s.strip() for s in sentences if s.strip()]
+    sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
 
-    # Nếu một câu quá dài, tiếp tục chia nhỏ để tránh passage bị loãng.
     result = []
+
     for sentence in sentences:
+        # Cắt tiếp nếu một câu quá dài.
         if len(sentence) <= 700:
             result.append(sentence)
         else:
             for start in range(0, len(sentence), 600):
                 chunk = sentence[start:start + 700].strip()
+
                 if chunk:
                     result.append(chunk)
 
@@ -62,17 +110,25 @@ def split_sentences(text):
 
 
 # ============================================================
-# 2. LOAD CORPUS AND CREATE PASSAGES
+# 2. ĐỌC JSON HOẶC JSONL
 # ============================================================
 
 def read_json_or_jsonl(file_path):
     """
-    Đọc được cả:
-    - JSON list: [{...}, {...}]
-    - JSONL: mỗi dòng là một object JSON
+    Hỗ trợ cả hai định dạng:
+
+    JSON list:
+    [
+        {"id": 1, ...},
+        {"id": 2, ...}
+    ]
+
+    JSONL:
+    {"id": 1, ...}
+    {"id": 2, ...}
     """
-    with open(file_path, "r", encoding="utf-8") as f:
-        raw_text = f.read().strip()
+    with open(file_path, "r", encoding="utf-8") as file:
+        raw_text = file.read().strip()
 
     if not raw_text:
         return []
@@ -87,14 +143,17 @@ def read_json_or_jsonl(file_path):
             for key in ["data", "documents", "items", "questions"]:
                 if isinstance(data.get(key), list):
                     return data[key]
+
             return [data]
 
     except json.JSONDecodeError:
         pass
 
     rows = []
+
     for line in raw_text.splitlines():
         line = line.strip()
+
         if not line:
             continue
 
@@ -106,27 +165,32 @@ def read_json_or_jsonl(file_path):
     return rows
 
 
-def load_passages(corpus_file="dataset.json", window_size=3, stride=2):
-    """
-    Chia mỗi document thành passage gồm một cửa sổ 3 câu.
+# ============================================================
+# 3. CHIA CORPUS THÀNH PASSAGE
+# ============================================================
 
-    Title được lặp lại hai lần để tăng trọng số nhẹ cho tiêu đề.
-    Đây là một cách đơn giản để mô phỏng field weighting.
+def load_passages(corpus_file):
+    """
+    Chia document thành passage 3 câu.
+
+    Mỗi passage giữ lại title.
+    Title được lặp lại để tăng trọng số.
     """
     documents = read_json_or_jsonl(corpus_file)
+
     passages = []
 
-    for doc_index, doc in enumerate(documents):
-        title = str(doc.get("title", "")).strip()
-        content = str(doc.get("content", "")).strip()
+    for doc_index, document in enumerate(documents):
+        title = str(document.get("title", "")).strip()
+        content = str(document.get("content", "")).strip()
 
         sentences = split_sentences(content)
 
         if not sentences:
             sentences = [content or title]
 
-        for start in range(0, len(sentences), stride):
-            selected_sentences = sentences[start:start + window_size]
+        for start in range(0, len(sentences), PASSAGE_STRIDE):
+            selected_sentences = sentences[start:start + PASSAGE_SIZE]
 
             if not selected_sentences:
                 continue
@@ -134,7 +198,8 @@ def load_passages(corpus_file="dataset.json", window_size=3, stride=2):
             body = " ".join(selected_sentences).strip()
 
             if title:
-                passage_text = f"{title}. {title}. {body}"
+                weighted_title = " ".join([title] * TITLE_REPEAT)
+                passage_text = f"{weighted_title} {body}"
             else:
                 passage_text = body
 
@@ -142,79 +207,106 @@ def load_passages(corpus_file="dataset.json", window_size=3, stride=2):
                 passages.append({
                     "doc_index": doc_index,
                     "title": title,
-                    "text": passage_text
+                    "text": passage_text,
+                    "normalized_text": normalize_text(passage_text)
                 })
 
     return passages
 
 
 # ============================================================
-# 3. BM25 USING AN INVERTED INDEX
+# 4. BM25 INVERTED INDEX
 # ============================================================
 
 class BM25InvertedIndex:
     """
-    Okapi BM25 sử dụng inverted index.
+    BM25 sử dụng inverted index.
 
-    Với mỗi term, chỉ lưu danh sách document có chứa term đó.
-    Khi truy vấn, không cần duyệt toàn bộ token trong toàn corpus.
+    Mỗi term lưu danh sách:
+        (passage_id, term_frequency)
+
+    Khi tìm kiếm, chỉ duyệt các passage chứa từ trong query.
+    Không cần duyệt toàn bộ corpus cho từng câu hỏi.
     """
 
     def __init__(self, texts, k1=1.5, b=0.75):
         self.k1 = k1
         self.b = b
 
-        self.tokenized_docs = [tokenize(text) for text in texts]
-        self.num_docs = len(self.tokenized_docs)
-
-        self.doc_lengths = np.array(
-            [len(tokens) for tokens in self.tokenized_docs],
-            dtype=np.float32
-        )
-
-        self.avg_doc_length = float(self.doc_lengths.mean()) \
-            if self.num_docs > 0 else 0.0
+        self.tokenized_documents = []
+        self.document_lengths = []
 
         self.inverted_index = defaultdict(list)
         self.idf = {}
 
-        self._build_index()
+        self._build(texts)
 
-    def _build_index(self):
+    def _build(self, texts):
         document_frequency = Counter()
 
-        for doc_id, tokens in enumerate(self.tokenized_docs):
+        print("Đang tách từ corpus và xây dựng inverted index...")
+
+        for document_id, text in enumerate(texts):
+            tokens = tokenize(text)
+
+            self.tokenized_documents.append(tokens)
+            self.document_lengths.append(len(tokens))
+
             term_frequency = Counter(tokens)
 
             for term, frequency in term_frequency.items():
-                self.inverted_index[term].append((doc_id, frequency))
+                self.inverted_index[term].append((document_id, frequency))
                 document_frequency[term] += 1
 
+        self.num_documents = len(self.tokenized_documents)
+
+        if self.num_documents == 0:
+            self.average_document_length = 0.0
+            return
+
+        self.average_document_length = (
+            sum(self.document_lengths) / self.num_documents
+        )
+
         for term, frequency in document_frequency.items():
-            # Công thức BM25 IDF ổn định và luôn dương.
             self.idf[term] = math.log(
                 1.0
-                + (self.num_docs - frequency + 0.5)
-                / (frequency + 0.5)
+                + (
+                    self.num_documents
+                    - frequency
+                    + 0.5
+                )
+                / (
+                    frequency
+                    + 0.5
+                )
             )
 
-    def score(self, query):
-        query_tokens = tokenize(query)
-        scores = np.zeros(self.num_docs, dtype=np.float32)
+    def search(self, query, top_k=20):
+        """
+        Trả về danh sách:
+            [(passage_id, bm25_score), ...]
 
-        if not query_tokens or self.avg_doc_length == 0:
-            return scores
+        Chỉ giữ top-k passage.
+        """
+        query_tokens = tokenize(query)
+
+        if not query_tokens:
+            return []
 
         query_term_frequency = Counter(query_tokens)
+        scores = defaultdict(float)
 
         for term, query_frequency in query_term_frequency.items():
-            if term not in self.inverted_index:
+            postings = self.inverted_index.get(term)
+
+            if not postings:
                 continue
 
             idf = self.idf.get(term, 0.0)
 
-            for doc_id, term_frequency in self.inverted_index[term]:
-                doc_length = self.doc_lengths[doc_id]
+            for document_id, term_frequency in postings:
+                document_length = self.document_lengths[document_id]
 
                 denominator = (
                     term_frequency
@@ -222,11 +314,13 @@ class BM25InvertedIndex:
                     * (
                         1.0
                         - self.b
-                        + self.b * doc_length / self.avg_doc_length
+                        + self.b
+                        * document_length
+                        / self.average_document_length
                     )
                 )
 
-                scores[doc_id] += (
+                score = (
                     idf
                     * term_frequency
                     * (self.k1 + 1.0)
@@ -234,121 +328,64 @@ class BM25InvertedIndex:
                     * query_frequency
                 )
 
-        return scores
+                scores[document_id] += score
 
+        if not scores:
+            return []
 
-# ============================================================
-# 4. HYBRID RETRIEVER
-# ============================================================
-
-def min_max_normalize(values):
-    values = np.asarray(values, dtype=np.float32)
-
-    if len(values) == 0:
-        return values
-
-    minimum = float(values.min())
-    maximum = float(values.max())
-
-    if maximum - minimum < 1e-12:
-        return np.zeros_like(values)
-
-    return (values - minimum) / (maximum - minimum)
-
-
-class HybridRetriever:
-    """
-    Kết hợp:
-    - BM25
-    - TF-IDF word unigram + bigram
-    - TF-IDF character n-gram
-
-    Word n-gram bắt từ và cụm từ.
-    Character n-gram hỗ trợ lỗi chính tả và biến thể cách viết.
-    """
-
-    def __init__(self, passages):
-        self.passages = passages
-        self.texts = [passage["text"] for passage in passages]
-
-        if not self.texts:
-            raise ValueError("Corpus không có passage hợp lệ.")
-
-        print("Đang xây dựng BM25 inverted index...")
-        self.bm25 = BM25InvertedIndex(self.texts)
-
-        print("Đang xây dựng TF-IDF word n-gram...")
-        self.word_vectorizer = TfidfVectorizer(
-            preprocessor=normalize_text,
-            tokenizer=None,
-            token_pattern=r"(?u)\b\w+\b",
-            ngram_range=(1, 2),
-            sublinear_tf=True,
-            norm="l2",
-            dtype=np.float32,
-            max_features=250_000
+        return heapq.nlargest(
+            top_k,
+            scores.items(),
+            key=lambda item: item[1]
         )
 
-        self.word_matrix = self.word_vectorizer.fit_transform(self.texts)
-
-        print("Đang xây dựng TF-IDF character n-gram...")
-        self.char_vectorizer = TfidfVectorizer(
-            preprocessor=normalize_text,
-            analyzer="char_wb",
-            ngram_range=(3, 5),
-            sublinear_tf=True,
-            norm="l2",
-            dtype=np.float32,
-            max_features=180_000
-        )
-
-        self.char_matrix = self.char_vectorizer.fit_transform(self.texts)
-
-    def get_raw_scores(self, query):
-        """Tính toàn bộ điểm retrieval trước khi trộn."""
-        bm25_scores = self.bm25.score(query)
-
-        word_query_vector = self.word_vectorizer.transform([query])
-        word_scores = (self.word_matrix @ word_query_vector.T).toarray().ravel()
-
-        char_query_vector = self.char_vectorizer.transform([query])
-        char_scores = (self.char_matrix @ char_query_vector.T).toarray().ravel()
-
-        return {
-            "bm25": bm25_scores,
-            "word": word_scores,
-            "char": char_scores
-        }
-
-    def search(self, query, top_k=20):
+    def score_document(self, query_tokens, document_id):
         """
-        Hybrid retrieval.
-        Chuẩn hóa từng nhóm điểm trước khi kết hợp.
+        Tính BM25 của query đối với một passage cụ thể.
+        Chỉ dùng trong bước rerank top-k nên rất nhanh.
         """
-        scores = self.get_raw_scores(query)
+        if not query_tokens:
+            return 0.0
 
-        hybrid_scores = (
-            0.50 * min_max_normalize(scores["bm25"])
-            + 0.35 * min_max_normalize(scores["word"])
-            + 0.15 * min_max_normalize(scores["char"])
-        )
+        document_tokens = self.tokenized_documents[document_id]
+        document_term_frequency = Counter(document_tokens)
 
-        top_k = min(top_k, len(self.texts))
+        document_length = self.document_lengths[document_id]
+        score = 0.0
 
-        if top_k <= 0:
-            return [], scores, hybrid_scores
+        for term, query_frequency in Counter(query_tokens).items():
+            term_frequency = document_term_frequency.get(term, 0)
 
-        if top_k == len(self.texts):
-            indices = np.argsort(-hybrid_scores)
-        else:
-            indices = np.argpartition(-hybrid_scores, top_k - 1)[:top_k]
-            indices = indices[np.argsort(-hybrid_scores[indices])]
+            if term_frequency == 0:
+                continue
 
-        return indices.tolist(), scores, hybrid_scores
+            idf = self.idf.get(term, 0.0)
+
+            denominator = (
+                term_frequency
+                + self.k1
+                * (
+                    1.0
+                    - self.b
+                    + self.b
+                    * document_length
+                    / self.average_document_length
+                )
+            )
+
+            score += (
+                idf
+                * term_frequency
+                * (self.k1 + 1.0)
+                / denominator
+                * query_frequency
+            )
+
+        return score
 
 
 # ============================================================
-# 5. ANSWER SCORING FEATURES
+# 5. FEATURE CHỌN ĐÁP ÁN
 # ============================================================
 
 NEGATIVE_PATTERNS = [
@@ -358,14 +395,17 @@ NEGATIVE_PATTERNS = [
     r"\bkhông thuộc\b",
     r"\bkhông bao gồm\b",
     r"\bngoại trừ\b",
+    r"\bsai là\b",
     r"\bphát biểu sai\b",
     r"\bnhận định sai\b",
-    r"\bsai là\b",
     r"\bchưa đúng\b"
 ]
 
 
 def is_negative_question(question):
+    """
+    Nhận biết câu hỏi yêu cầu tìm đáp án sai hoặc ngoại lệ.
+    """
     normalized_question = normalize_text(question)
 
     return any(
@@ -374,49 +414,39 @@ def is_negative_question(question):
     )
 
 
-def top_mean(values, top_n=3):
-    values = np.asarray(values, dtype=np.float32)
-
-    if len(values) == 0:
-        return 0.0
-
-    selected = np.sort(values)[-top_n:]
-    return float(selected.mean())
-
-
-def get_choice_similarity(retriever, choice, passage_indices):
+def min_max_normalize(values):
     """
-    Tính cosine similarity giữa đáp án và các passage đã lấy ra.
+    Chuẩn hóa danh sách điểm A/B/C/D về khoảng [0, 1].
     """
-    if not passage_indices or not normalize_text(choice):
-        return 0.0, 0.0
+    if not values:
+        return []
 
-    word_vector = retriever.word_vectorizer.transform([choice])
-    word_scores = (
-        retriever.word_matrix[passage_indices] @ word_vector.T
-    ).toarray().ravel()
+    minimum = min(values)
+    maximum = max(values)
 
-    char_vector = retriever.char_vectorizer.transform([choice])
-    char_scores = (
-        retriever.char_matrix[passage_indices] @ char_vector.T
-    ).toarray().ravel()
+    if maximum - minimum < 1e-12:
+        return [0.0] * len(values)
 
-    return top_mean(word_scores), top_mean(char_scores)
+    return [
+        (value - minimum) / (maximum - minimum)
+        for value in values
+    ]
 
 
-def calculate_idf_overlap(retriever, choice, passage_indices):
+def calculate_idf_overlap(index, choice_tokens, passage_ids):
     """
-    Tỷ lệ token của đáp án được passage hỗ trợ.
-    Token hiếm có trọng số cao hơn token phổ biến.
-    """
-    choice_tokens = set(tokenize(choice))
+    Tính tỷ lệ token quan trọng của đáp án được corpus hỗ trợ.
 
-    if not choice_tokens or not passage_indices:
+    Từ hiếm có trọng số cao hơn từ phổ biến.
+    """
+    unique_choice_tokens = set(choice_tokens)
+
+    if not unique_choice_tokens or not passage_ids:
         return 0.0
 
     denominator = sum(
-        retriever.bm25.idf.get(token, 0.1)
-        for token in choice_tokens
+        index.idf.get(token, 0.1)
+        for token in unique_choice_tokens
     )
 
     if denominator <= 0:
@@ -424,365 +454,316 @@ def calculate_idf_overlap(retriever, choice, passage_indices):
 
     best_score = 0.0
 
-    for passage_index in passage_indices[:8]:
-        passage_tokens = set(
-            retriever.bm25.tokenized_docs[passage_index]
-        )
+    for passage_id in passage_ids:
+        passage_tokens = set(index.tokenized_documents[passage_id])
 
         numerator = sum(
-            retriever.bm25.idf.get(token, 0.1)
-            for token in choice_tokens
+            index.idf.get(token, 0.1)
+            for token in unique_choice_tokens
             if token in passage_tokens
         )
 
         best_score = max(best_score, numerator / denominator)
 
-    return float(best_score)
+    return best_score
 
 
-def calculate_exact_phrase_score(retriever, choice, passage_indices):
+def calculate_exact_phrase(choice, passages, passage_ids):
     """
-    Kiểm tra đáp án có xuất hiện nguyên cụm trong passage hay không.
-    Chỉ dùng khi đáp án có ít nhất hai token.
-    """
-    normalized_choice = normalize_text(choice)
+    Kiểm tra đáp án có xuất hiện nguyên cụm trong passage không.
 
-    if len(tokenize(normalized_choice)) < 2:
+    Không dùng với đáp án chỉ có một token vì dễ gây nhiễu.
+    """
+    choice = normalize_text(choice)
+
+    if len(tokenize(choice)) < 2:
         return 0.0
 
-    for passage_index in passage_indices[:8]:
-        normalized_passage = normalize_text(
-            retriever.texts[passage_index]
-        )
+    for passage_id in passage_ids:
+        passage_text = passages[passage_id]["normalized_text"]
 
-        if normalized_choice in normalized_passage:
+        if choice in passage_text:
             return 1.0
 
     return 0.0
 
 
-def fuzzy_similarity(text_a, text_b):
+def calculate_choice_features(
+    index,
+    passages,
+    question,
+    choice,
+    question_passage_ids
+):
     """
-    Fuzzy matching bằng SequenceMatcher trong thư viện chuẩn.
-    So sánh với từng câu để tránh passage dài làm giảm điểm.
+    Tính feature cho một đáp án.
+
+    Không dùng char n-gram.
+    Không dùng fuzzy matching.
+    Không quét toàn corpus ngoài inverted index.
     """
-    text_a = normalize_text(text_a)
-    text_b = normalize_text(text_b)
+    choice_tokens = tokenize(choice)
+    combined_query = f"{question} {choice}"
 
-    if not text_a or not text_b:
-        return 0.0
+    # Truy xuất bổ sung bằng câu hỏi + đáp án.
+    combined_results = index.search(
+        combined_query,
+        top_k=CHOICE_TOP_K
+    )
 
-    candidates = split_sentences(text_b)
-
-    if not candidates:
-        candidates = [text_b]
-
-    scores = [
-        SequenceMatcher(
-            None,
-            text_a,
-            normalize_text(candidate)
-        ).ratio()
-        for candidate in candidates
+    combined_passage_ids = [
+        passage_id
+        for passage_id, _ in combined_results
     ]
 
-    return max(scores, default=0.0)
+    # Gộp passage từ câu hỏi gốc và question + choice.
+    candidate_passage_ids = list(
+        dict.fromkeys(
+            question_passage_ids
+            + combined_passage_ids
+        )
+    )
 
+    # Giữ số lượng ứng viên nhỏ để rerank nhanh.
+    candidate_passage_ids = candidate_passage_ids[:40]
 
-def calculate_fuzzy_score(retriever, choice, passage_indices):
-    """
-    Điểm fuzzy tốt nhất trong các passage liên quan nhất.
-    """
-    if not normalize_text(choice):
-        return 0.0
+    if combined_results:
+        best_combined_bm25 = combined_results[0][1]
+        mean_top3_combined_bm25 = (
+            sum(score for _, score in combined_results[:3])
+            / min(3, len(combined_results))
+        )
+    else:
+        best_combined_bm25 = 0.0
+        mean_top3_combined_bm25 = 0.0
 
-    return max(
-        (
-            fuzzy_similarity(
-                choice,
-                retriever.texts[passage_index]
-            )
-            for passage_index in passage_indices[:5]
-        ),
+    # Đáp án riêng lẻ có được passage hỗ trợ hay không?
+    choice_support_scores = [
+        index.score_document(
+            query_tokens=choice_tokens,
+            document_id=passage_id
+        )
+        for passage_id in candidate_passage_ids
+    ]
+
+    best_choice_support = max(
+        choice_support_scores,
         default=0.0
     )
 
-
-def extract_choice_features(
-    retriever,
-    question,
-    choice,
-    question_passage_indices,
-    answer_top_k=15
-):
-    """
-    Chấm một đáp án bằng nhiều tín hiệu độc lập.
-    """
-    answer_aware_query = f"{question} {choice}"
-
-    answer_indices, raw_scores, _ = retriever.search(
-        answer_aware_query,
-        top_k=answer_top_k
+    idf_overlap = calculate_idf_overlap(
+        index=index,
+        choice_tokens=choice_tokens,
+        passage_ids=candidate_passage_ids[:15]
     )
 
-    # Mức độ passage phù hợp với cả câu hỏi và đáp án.
-    word_retrieval_score = top_mean(
-        raw_scores["word"][answer_indices]
-    )
-
-    char_retrieval_score = top_mean(
-        raw_scores["char"][answer_indices]
-    )
-
-    unique_query_token_count = max(
-        len(set(tokenize(answer_aware_query))),
-        1
-    )
-
-    normalized_bm25_score = math.log1p(
-        float(np.max(raw_scores["bm25"][answer_indices]))
-        / unique_query_token_count
-    ) if answer_indices else 0.0
-
-    # Mức độ đáp án được hỗ trợ bởi passage lấy theo question + choice.
-    local_word_support, local_char_support = get_choice_similarity(
-        retriever,
-        choice,
-        answer_indices
-    )
-
-    # Mức độ đáp án được hỗ trợ bởi passage lấy từ câu hỏi gốc.
-    global_word_support, global_char_support = get_choice_similarity(
-        retriever,
-        choice,
-        question_passage_indices
-    )
-
-    overlap_score = calculate_idf_overlap(
-        retriever,
-        choice,
-        answer_indices
-    )
-
-    exact_phrase_score = calculate_exact_phrase_score(
-        retriever,
-        choice,
-        answer_indices
-    )
-
-    fuzzy_score = calculate_fuzzy_score(
-        retriever,
-        choice,
-        answer_indices
+    exact_phrase = calculate_exact_phrase(
+        choice=choice,
+        passages=passages,
+        passage_ids=candidate_passage_ids[:15]
     )
 
     return {
-        "word_retrieval": word_retrieval_score,
-        "char_retrieval": char_retrieval_score,
-        "bm25_retrieval": normalized_bm25_score,
-        "local_word_support": local_word_support,
-        "local_char_support": local_char_support,
-        "global_word_support": global_word_support,
-        "global_char_support": global_char_support,
-        "idf_overlap": overlap_score,
-        "exact_phrase": exact_phrase_score,
-        "fuzzy": fuzzy_score
+        "best_combined_bm25": best_combined_bm25,
+        "mean_top3_combined_bm25": mean_top3_combined_bm25,
+        "best_choice_support": best_choice_support,
+        "idf_overlap": idf_overlap,
+        "exact_phrase": exact_phrase
     }
 
 
 # ============================================================
-# 6. RERANK FOUR ANSWERS
+# 6. RERANK A/B/C/D
 # ============================================================
 
 FEATURE_WEIGHTS = {
-    "word_retrieval": 0.12,
-    "char_retrieval": 0.05,
-    "bm25_retrieval": 0.12,
-    "local_word_support": 0.15,
-    "local_char_support": 0.06,
-    "global_word_support": 0.13,
-    "global_char_support": 0.05,
-    "idf_overlap": 0.16,
-    "exact_phrase": 0.10,
-    "fuzzy": 0.06
+    "best_combined_bm25": 0.30,
+    "mean_top3_combined_bm25": 0.20,
+    "best_choice_support": 0.20,
+    "idf_overlap": 0.20,
+    "exact_phrase": 0.10
 }
 
 
-def normalize_features_between_choices(choice_features):
+def predict_answer(index, passages, item):
     """
-    Chuẩn hóa từng feature giữa A/B/C/D.
-
-    Ví dụ:
-    - A có BM25 cao nhất sẽ gần 1
-    - D có BM25 thấp nhất sẽ gần 0
-
-    Nhờ đó các feature có thang điểm khác nhau vẫn kết hợp được.
+    Truy xuất passage và chọn đáp án A/B/C/D.
     """
-    normalized = {
-        key: {}
-        for key in choice_features
-    }
-
-    feature_names = next(iter(choice_features.values())).keys()
-
-    for feature_name in feature_names:
-        values = np.array(
-            [
-                choice_features[key][feature_name]
-                for key in choice_features
-            ],
-            dtype=np.float32
-        )
-
-        scaled_values = min_max_normalize(values)
-
-        for index, choice_key in enumerate(choice_features):
-            normalized[choice_key][feature_name] = float(
-                scaled_values[index]
-            )
-
-    return normalized
-
-
-def predict_answer(retriever, item, question_top_k=25):
     question = str(item.get("question", ""))
-    valid_choices = ["A", "B", "C", "D"]
+    choice_keys = ["A", "B", "C", "D"]
 
-    question_indices, _, _ = retriever.search(
-        question,
-        top_k=question_top_k
+    # Bước 1: retrieval bằng câu hỏi gốc.
+    question_results = index.search(
+        query=question,
+        top_k=QUESTION_TOP_K
     )
 
-    raw_choice_features = {}
+    question_passage_ids = [
+        passage_id
+        for passage_id, _ in question_results
+    ]
 
-    for choice_key in valid_choices:
+    # Bước 2: tính feature riêng cho từng đáp án.
+    all_features = {}
+
+    for choice_key in choice_keys:
         choice_text = str(item.get(choice_key, ""))
 
-        raw_choice_features[choice_key] = extract_choice_features(
-            retriever=retriever,
+        all_features[choice_key] = calculate_choice_features(
+            index=index,
+            passages=passages,
             question=question,
             choice=choice_text,
-            question_passage_indices=question_indices
+            question_passage_ids=question_passage_ids
         )
 
-    normalized_choice_features = normalize_features_between_choices(
-        raw_choice_features
-    )
+    # Bước 3: chuẩn hóa từng feature giữa bốn đáp án.
+    normalized_features = {
+        choice_key: {}
+        for choice_key in choice_keys
+    }
 
+    for feature_name in FEATURE_WEIGHTS:
+        feature_values = [
+            all_features[choice_key][feature_name]
+            for choice_key in choice_keys
+        ]
+
+        normalized_values = min_max_normalize(feature_values)
+
+        for index_choice, choice_key in enumerate(choice_keys):
+            normalized_features[choice_key][feature_name] = (
+                normalized_values[index_choice]
+            )
+
+    # Bước 4: tính tổng điểm.
     final_scores = {}
 
-    for choice_key in valid_choices:
+    for choice_key in choice_keys:
         final_scores[choice_key] = sum(
             FEATURE_WEIGHTS[feature_name]
-            * normalized_choice_features[choice_key][feature_name]
+            * normalized_features[choice_key][feature_name]
             for feature_name in FEATURE_WEIGHTS
         )
 
-    negative_question = is_negative_question(question)
-
-    if negative_question:
-        predicted_answer = min(final_scores, key=final_scores.get)
+    # Bước 5: nếu câu hỏi phủ định, chọn đáp án ít được hỗ trợ nhất.
+    if is_negative_question(question):
+        predicted_answer = min(
+            final_scores,
+            key=final_scores.get
+        )
     else:
-        predicted_answer = max(final_scores, key=final_scores.get)
+        predicted_answer = max(
+            final_scores,
+            key=final_scores.get
+        )
 
     debug_info = {
-        "negative_question": negative_question,
+        "negative_question": is_negative_question(question),
         "scores": final_scores,
-        "raw_features": raw_choice_features,
-        "normalized_features": normalized_choice_features
+        "features": all_features
     }
 
     return predicted_answer, debug_info
 
 
 # ============================================================
-# 7. CREATE SUBMISSION
+# 7. SINH SUBMISSION
 # ============================================================
 
-def make_submission(
-    test_file="/content/de_thi.json",
-    corpus_file="/content/dataset.json",
-    output_file="submission.json",
-    zip_file="submission.zip",
-    debug_file="debug_predictions.json"
-):
-    print("Đang đọc corpus và chia passage...")
-    passages = load_passages(
-        corpus_file=corpus_file,
-        window_size=3,
-        stride=2
-    )
+def create_submission():
+    print("Đang đọc corpus...")
+    passages = load_passages(CORPUS_FILE)
 
     if not passages:
-        print("Lỗi: corpus không có passage hợp lệ.")
-        return
+        raise ValueError("Corpus không có passage hợp lệ.")
 
     print(f"Đã tạo {len(passages)} passage.")
 
-    retriever = HybridRetriever(passages)
+    index = BM25InvertedIndex(
+        texts=[
+            passage["text"]
+            for passage in passages
+        ],
+        k1=BM25_K1,
+        b=BM25_B
+    )
 
-    test_data = read_json_or_jsonl(test_file)
+    print("Đang đọc câu hỏi...")
+    test_data = read_json_or_jsonl(TEST_FILE)
 
     if not test_data:
-        print("Lỗi: không đọc được dữ liệu đề thi.")
-        return
+        raise ValueError("Không đọc được dữ liệu đề thi.")
 
     submissions = []
     debug_predictions = []
 
-    print("Bắt đầu truy xuất và dự đoán đáp án...")
+    print(f"Bắt đầu dự đoán {len(test_data)} câu hỏi...")
 
-    for index, item in enumerate(test_data, start=1):
+    for position, item in enumerate(test_data, start=1):
         question_id = item.get("id")
 
-        answer, debug_info = predict_answer(
-            retriever=retriever,
+        predicted_answer, debug_info = predict_answer(
+            index=index,
+            passages=passages,
             item=item
         )
 
         submissions.append({
             "id": question_id,
-            "answer": answer
+            "answer": predicted_answer
         })
 
         debug_predictions.append({
             "id": question_id,
-            "question": item.get("question", ""),
-            "prediction": answer,
+            "answer": predicted_answer,
             **debug_info
         })
 
-        if index % 20 == 0 or index == len(test_data):
-            print(f"Đã xử lý {index}/{len(test_data)} câu.")
+        if position % 25 == 0 or position == len(test_data):
+            print(
+                f"Đã xử lý {position}/{len(test_data)} câu."
+            )
 
-    with open(output_file, "w", encoding="utf-8") as f:
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
         json.dump(
             submissions,
-            f,
+            file,
             ensure_ascii=False,
             indent=2
         )
 
-    with open(debug_file, "w", encoding="utf-8") as f:
+    # File debug giúp kiểm tra nếu kết quả chưa tốt.
+    with open("debug_predictions.json", "w", encoding="utf-8") as file:
         json.dump(
             debug_predictions,
-            f,
+            file,
             ensure_ascii=False,
             indent=2
         )
 
+    # Zip cả code và file đáp án để tránh hệ thống chấm 0 điểm.
     with zipfile.ZipFile(
-        zip_file,
+        ZIP_FILE,
         "w",
         zipfile.ZIP_DEFLATED
-    ) as zipf:
-        zipf.write(output_file)
+    ) as zip_file:
+        zip_file.write(OUTPUT_FILE)
 
-    print(f"Đã xử lý xong {len(submissions)} câu hỏi.")
-    print(f"File đáp án: {output_file}")
-    print(f"File debug: {debug_file}")
-    print(f"File nộp bài: {zip_file}")
+        current_code_file = Path(sys.argv[0])
+
+        if current_code_file.exists() and current_code_file.suffix == ".py":
+            zip_file.write(
+                current_code_file,
+                arcname="/content/IR_cuoiki.py"
+            )
+
+    print()
+    print("Đã hoàn thành.")
+    print(f"File đáp án: {OUTPUT_FILE}")
+    print(f"File debug: debug_predictions.json")
+    print(f"File nộp bài: {ZIP_FILE}")
 
 
 if __name__ == "__main__":
-    make_submission()
+    create_submission()

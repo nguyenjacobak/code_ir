@@ -1,769 +1,242 @@
-import heapq
+"""
+baseline_v2.py — TF-IDF retrieval + scoring (~61.7%).
+Chạy: cd Final && python baseline_v2.py
+Cần: dataset.json (~70k dòng), de_thi.json (765 câu) trong cùng thư mục Final/
+"""
 import json
-import math
+import os
 import re
-import sys
-import unicodedata
 import zipfile
-from collections import Counter, defaultdict
-from pathlib import Path
 
-from pyvi import ViTokenizer
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
+# [V2] Thêm cấu hình — root không có
+TOP_K = 90
+W_COSINE = 0.50
+W_OVERLAP = 0.20
+W_COVERAGE = 0.20
+W_SUBSTRING = 0.10
+TIE_THRESHOLD = 0.01  # hai đáp án sát điểm hơn ngưỡng này thì tie-break
 
-# ============================================================
-# CẤU HÌNH
-# ============================================================
+MIN_CORPUS_DOCS = 50000  # Final/dataset.json có ~70k điều — phát hiện chạy sai thư mục
+EXPECTED_QUESTIONS = 765  # Final/de_thi.json — KHÔNG dùng de_thi.json 1000 câu ở thư mục gốc
 
-CORPUS_FILE = "/content/dataset.json"
-TEST_FILE = "/content/de_thi.json"
-
-OUTPUT_FILE = "submission.json"
-ZIP_FILE = "submission.zip"
-
-# Mỗi passage gồm 3 câu, cửa sổ trượt 2 câu.
-PASSAGE_SIZE = 3
-PASSAGE_STRIDE = 2
-
-# Số passage lấy từ câu hỏi gốc.
-QUESTION_TOP_K = 25
-
-# Số passage lấy từ question + từng đáp án.
-CHOICE_TOP_K = 12
-
-# Tham số BM25.
-BM25_K1 = 1.5
-BM25_B = 0.75
-
-# Tiêu đề quan trọng hơn content.
-# Lặp title là cách đơn giản để tăng trọng số mà không cần BM25F phức tạp.
-TITLE_REPEAT = 2
+# Câu hỏi dạng "không thuộc / không đúng" → chọn đáp án ít khớp luật nhất
+NEGATION_RE = re.compile(
+    r"không thuộc|không bao gồm|điểm không đúng|không đúng là gì",
+    re.IGNORECASE,
+)
 
 
-# ============================================================
-# 1. CHUẨN HÓA VÀ TÁCH TỪ TIẾNG VIỆT
-# ============================================================
-
-def normalize_text(text):
-    """
-    Chuẩn hóa văn bản:
-    - Unicode NFC
-    - chữ thường
-    - bỏ dấu câu không cần thiết
-    - giữ dấu gạch dưới do PyVi sinh ra
-    """
-    text = str(text or "")
-    text = unicodedata.normalize("NFC", text.lower())
-
-    # Giữ lại chữ, số và underscore.
-    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
-    text = re.sub(r"\s+", " ", text).strip()
-
-    return text
+def is_negation_question(question_norm):
+    return bool(NEGATION_RE.search(question_norm))
 
 
 def tokenize(text):
-    """
-    Tách từ tiếng Việt bằng PyVi.
-
-    Ví dụ:
-    "công nghệ thông tin"
-    → ["công_nghệ", "thông_tin"]
-    """
-    text = normalize_text(text)
-
-    if not text:
-        return []
-
-    segmented_text = ViTokenizer.tokenize(text)
-
-    return segmented_text.split()
+    return re.findall(r"\w+", text)
 
 
-def split_sentences(text):
-    """
-    Chia content thành các câu ngắn.
-    Tránh passage quá dài làm loãng kết quả retrieval.
-    """
-    text = str(text or "").strip()
-
-    if not text:
-        return []
-
-    sentences = re.split(r"(?<=[.!?;:])\s+|\n+", text)
-    sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
-
-    result = []
-
-    for sentence in sentences:
-        # Cắt tiếp nếu một câu quá dài.
-        if len(sentence) <= 700:
-            result.append(sentence)
-        else:
-            for start in range(0, len(sentence), 600):
-                chunk = sentence[start:start + 700].strip()
-
-                if chunk:
-                    result.append(chunk)
-
-    return result
+def retrieve_top_k_tfidf(question_norm, vectorizer, doc_vectors, top_k):
+    """Retrieval bằng cosine TF-IDF — phù hợp bộ Final hơn BM25."""
+    query_vector = vectorizer.transform([question_norm])
+    similarities = cosine_similarity(query_vector, doc_vectors).flatten()
+    n = len(similarities)
+    k = min(top_k, n)
+    if k == n:
+        return np.argsort(similarities)[-k:][::-1]
+    idx = np.argpartition(similarities, -k)[-k:]
+    return idx[np.argsort(similarities[idx])][::-1]
 
 
-# ============================================================
-# 2. ĐỌC JSON HOẶC JSONL
-# ============================================================
+def pick_answer(choice_scores, choice_coverage, choice_substring, pick_lowest):
+    """Chọn đáp án; nếu top-2 sát điểm thì ưu tiên coverage rồi substring."""
+    if not choice_scores:
+        return "B"  # mặc định nếu không tính được điểm nào (câu rất khó hoặc lỗi dữ liệu)
 
-def read_json_or_jsonl(file_path):
-    """
-    Hỗ trợ cả hai định dạng:
+    ranked = sorted(choice_scores.items(), key=lambda x: x[1], reverse=not pick_lowest)
+    best_choice, best_score = ranked[0]
+    if len(ranked) == 1:
+        return best_choice
 
-    JSON list:
-    [
-        {"id": 1, ...},
-        {"id": 2, ...}
-    ]
+    second_score = ranked[1][1]
+    if abs(best_score - second_score) >= TIE_THRESHOLD:
+        return best_choice
 
-    JSONL:
-    {"id": 1, ...}
-    {"id": 2, ...}
-    """
-    with open(file_path, "r", encoding="utf-8") as file:
-        raw_text = file.read().strip()
+    candidates = [ranked[0][0], ranked[1][0]]
 
-    if not raw_text:
-        return []
+    def tie_rank(choice):
+        cov = choice_coverage.get(choice, 0.0)
+        sub = choice_substring.get(choice, 0.0)
+        if pick_lowest:
+            return (cov, sub)  # phủ định: coverage thấp hơn tốt hơn
+        return (-cov, -sub)  # bình thường: coverage/substring cao hơn tốt hơn
 
+    return min(candidates, key=tie_rank) if pick_lowest else max(candidates, key=tie_rank)
+
+
+def load_corpus(corpus_file="dataset.json"):
+    """Đọc dataset.json — mỗi dòng 1 điều luật (JSON Lines)."""
+    documents = []
     try:
-        data = json.loads(raw_text)
-
-        if isinstance(data, list):
-            return data
-
-        if isinstance(data, dict):
-            for key in ["data", "documents", "items", "questions"]:
-                if isinstance(data.get(key), list):
-                    return data[key]
-
-            return [data]
-
-    except json.JSONDecodeError:
-        pass
-
-    rows = []
-
-    for line in raw_text.splitlines():
-        line = line.strip()
-
-        if not line:
-            continue
-
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-
-    return rows
-
-
-# ============================================================
-# 3. CHIA CORPUS THÀNH PASSAGE
-# ============================================================
-
-def load_passages(corpus_file):
-    """
-    Chia document thành passage 3 câu.
-
-    Mỗi passage giữ lại title.
-    Title được lặp lại để tăng trọng số.
-    """
-    documents = read_json_or_jsonl(corpus_file)
-
-    passages = []
-
-    for doc_index, document in enumerate(documents):
-        title = str(document.get("title", "")).strip()
-        content = str(document.get("content", "")).strip()
-
-        sentences = split_sentences(content)
-
-        if not sentences:
-            sentences = [content or title]
-
-        for start in range(0, len(sentences), PASSAGE_STRIDE):
-            selected_sentences = sentences[start:start + PASSAGE_SIZE]
-
-            if not selected_sentences:
-                continue
-
-            body = " ".join(selected_sentences).strip()
-
-            if title:
-                weighted_title = " ".join([title] * TITLE_REPEAT)
-                passage_text = f"{weighted_title} {body}"
-            else:
-                passage_text = body
-
-            if normalize_text(passage_text):
-                passages.append({
-                    "doc_index": doc_index,
-                    "title": title,
-                    "text": passage_text,
-                    "normalized_text": normalize_text(passage_text)
-                })
-
-    return passages
-
-
-# ============================================================
-# 4. BM25 INVERTED INDEX
-# ============================================================
-
-class BM25InvertedIndex:
-    """
-    BM25 sử dụng inverted index.
-
-    Mỗi term lưu danh sách:
-        (passage_id, term_frequency)
-
-    Khi tìm kiếm, chỉ duyệt các passage chứa từ trong query.
-    Không cần duyệt toàn bộ corpus cho từng câu hỏi.
-    """
-
-    def __init__(self, texts, k1=1.5, b=0.75):
-        self.k1 = k1
-        self.b = b
-
-        self.tokenized_documents = []
-        self.document_lengths = []
-
-        self.inverted_index = defaultdict(list)
-        self.idf = {}
-
-        self._build(texts)
-
-    def _build(self, texts):
-        document_frequency = Counter()
-
-        print("Đang tách từ corpus và xây dựng inverted index...")
-
-        for document_id, text in enumerate(texts):
-            tokens = tokenize(text)
-
-            self.tokenized_documents.append(tokens)
-            self.document_lengths.append(len(tokens))
-
-            term_frequency = Counter(tokens)
-
-            for term, frequency in term_frequency.items():
-                self.inverted_index[term].append((document_id, frequency))
-                document_frequency[term] += 1
-
-        self.num_documents = len(self.tokenized_documents)
-
-        if self.num_documents == 0:
-            self.average_document_length = 0.0
-            return
-
-        self.average_document_length = (
-            sum(self.document_lengths) / self.num_documents
-        )
-
-        for term, frequency in document_frequency.items():
-            self.idf[term] = math.log(
-                1.0
-                + (
-                    self.num_documents
-                    - frequency
-                    + 0.5
-                )
-                / (
-                    frequency
-                    + 0.5
-                )
-            )
-
-    def search(self, query, top_k=20):
-        """
-        Trả về danh sách:
-            [(passage_id, bm25_score), ...]
-
-        Chỉ giữ top-k passage.
-        """
-        query_tokens = tokenize(query)
-
-        if not query_tokens:
-            return []
-
-        query_term_frequency = Counter(query_tokens)
-        scores = defaultdict(float)
-
-        for term, query_frequency in query_term_frequency.items():
-            postings = self.inverted_index.get(term)
-
-            if not postings:
-                continue
-
-            idf = self.idf.get(term, 0.0)
-
-            for document_id, term_frequency in postings:
-                document_length = self.document_lengths[document_id]
-
-                denominator = (
-                    term_frequency
-                    + self.k1
-                    * (
-                        1.0
-                        - self.b
-                        + self.b
-                        * document_length
-                        / self.average_document_length
-                    )
-                )
-
-                score = (
-                    idf
-                    * term_frequency
-                    * (self.k1 + 1.0)
-                    / denominator
-                    * query_frequency
-                )
-
-                scores[document_id] += score
-
-        if not scores:
-            return []
-
-        return heapq.nlargest(
-            top_k,
-            scores.items(),
-            key=lambda item: item[1]
-        )
-
-    def score_document(self, query_tokens, document_id):
-        """
-        Tính BM25 của query đối với một passage cụ thể.
-        Chỉ dùng trong bước rerank top-k nên rất nhanh.
-        """
-        if not query_tokens:
-            return 0.0
-
-        document_tokens = self.tokenized_documents[document_id]
-        document_term_frequency = Counter(document_tokens)
-
-        document_length = self.document_lengths[document_id]
-        score = 0.0
-
-        for term, query_frequency in Counter(query_tokens).items():
-            term_frequency = document_term_frequency.get(term, 0)
-
-            if term_frequency == 0:
-                continue
-
-            idf = self.idf.get(term, 0.0)
-
-            denominator = (
-                term_frequency
-                + self.k1
-                * (
-                    1.0
-                    - self.b
-                    + self.b
-                    * document_length
-                    / self.average_document_length
-                )
-            )
-
-            score += (
-                idf
-                * term_frequency
-                * (self.k1 + 1.0)
-                / denominator
-                * query_frequency
-            )
-
-        return score
-
-
-# ============================================================
-# 5. FEATURE CHỌN ĐÁP ÁN
-# ============================================================
-
-NEGATIVE_PATTERNS = [
-    r"\bkhông đúng\b",
-    r"\bkhông chính xác\b",
-    r"\bkhông phải\b",
-    r"\bkhông thuộc\b",
-    r"\bkhông bao gồm\b",
-    r"\bngoại trừ\b",
-    r"\bsai là\b",
-    r"\bphát biểu sai\b",
-    r"\bnhận định sai\b",
-    r"\bchưa đúng\b"
-]
-
-
-def is_negative_question(question):
-    """
-    Nhận biết câu hỏi yêu cầu tìm đáp án sai hoặc ngoại lệ.
-    """
-    normalized_question = normalize_text(question)
-
-    return any(
-        re.search(pattern, normalized_question)
-        for pattern in NEGATIVE_PATTERNS
-    )
-
-
-def min_max_normalize(values):
-    """
-    Chuẩn hóa danh sách điểm A/B/C/D về khoảng [0, 1].
-    """
-    if not values:
-        return []
-
-    minimum = min(values)
-    maximum = max(values)
-
-    if maximum - minimum < 1e-12:
-        return [0.0] * len(values)
-
-    return [
-        (value - minimum) / (maximum - minimum)
-        for value in values
-    ]
-
-
-def calculate_idf_overlap(index, choice_tokens, passage_ids):
-    """
-    Tính tỷ lệ token quan trọng của đáp án được corpus hỗ trợ.
-
-    Từ hiếm có trọng số cao hơn từ phổ biến.
-    """
-    unique_choice_tokens = set(choice_tokens)
-
-    if not unique_choice_tokens or not passage_ids:
-        return 0.0
-
-    denominator = sum(
-        index.idf.get(token, 0.1)
-        for token in unique_choice_tokens
-    )
-
-    if denominator <= 0:
-        return 0.0
-
-    best_score = 0.0
-
-    for passage_id in passage_ids:
-        passage_tokens = set(index.tokenized_documents[passage_id])
-
-        numerator = sum(
-            index.idf.get(token, 0.1)
-            for token in unique_choice_tokens
-            if token in passage_tokens
-        )
-
-        best_score = max(best_score, numerator / denominator)
-
-    return best_score
-
-
-def calculate_exact_phrase(choice, passages, passage_ids):
-    """
-    Kiểm tra đáp án có xuất hiện nguyên cụm trong passage không.
-
-    Không dùng với đáp án chỉ có một token vì dễ gây nhiễu.
-    """
-    choice = normalize_text(choice)
-
-    if len(tokenize(choice)) < 2:
-        return 0.0
-
-    for passage_id in passage_ids:
-        passage_text = passages[passage_id]["normalized_text"]
-
-        if choice in passage_text:
-            return 1.0
-
-    return 0.0
-
-
-def calculate_choice_features(
-    index,
-    passages,
-    question,
-    choice,
-    question_passage_ids
+        with open(corpus_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    doc = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # [V2] Sửa từ root: root chỉ ghép title + content
+                title = str(doc.get("title", "")).lower().strip()
+                demuc = str(doc.get("demuc_name", "")).lower().strip()
+                chude = str(doc.get("chude_name", "")).lower().strip()
+                content = str(doc.get("content", "")).lower().strip()
+                text = f"{title} {title} {demuc} {chude} {content}".strip()
+
+                if text:
+                    documents.append(text)
+    except FileNotFoundError:
+        print(f"Lỗi: Không tìm thấy file {corpus_file}.")
+    return documents
+
+
+def make_submission(
+    test_file="de_thi.json",
+    corpus_file="dataset.json",
+    output_file="submission.json",
+    zip_file="submission.zip",
 ):
-    """
-    Tính feature cho một đáp án.
-
-    Không dùng char n-gram.
-    Không dùng fuzzy matching.
-    Không quét toàn corpus ngoài inverted index.
-    """
-    choice_tokens = tokenize(choice)
-    combined_query = f"{question} {choice}"
-
-    # Truy xuất bổ sung bằng câu hỏi + đáp án.
-    combined_results = index.search(
-        combined_query,
-        top_k=CHOICE_TOP_K
-    )
-
-    combined_passage_ids = [
-        passage_id
-        for passage_id, _ in combined_results
-    ]
-
-    # Gộp passage từ câu hỏi gốc và question + choice.
-    candidate_passage_ids = list(
-        dict.fromkeys(
-            question_passage_ids
-            + combined_passage_ids
+    # 1. Tải corpus (giống root)
+    documents = load_corpus(corpus_file)
+    if not documents:
+        print("Lỗi: Corpus rỗng. Hãy chạy trong thư mục Final/ có dataset.json dạng JSON Lines.")
+        return
+    if len(documents) < MIN_CORPUS_DOCS:
+        print(
+            f"Cảnh báo: chỉ tải {len(documents)} điều luật "
+            f"(cần ~70k). Có thể đang chạy sai thư mục hoặc sai file dataset."
         )
+        return
+    print(f"Đã tải {len(documents)} tài liệu từ tập corpus...")
+
+    # 2. Xây TF-IDF
+    vectorizer = TfidfVectorizer(
+        lowercase=True,
+        ngram_range=(1, 2),
+        sublinear_tf=True,
+        min_df=1,
+        max_df=0.95,
     )
+    doc_vectors = vectorizer.fit_transform(documents)
+    doc_word_sets = [set(tokenize(doc)) for doc in documents]
 
-    # Giữ số lượng ứng viên nhỏ để rerank nhanh.
-    candidate_passage_ids = candidate_passage_ids[:40]
+    # 3. Đọc đề thi (giống root)
+    try:
+        with open(test_file, "r", encoding="utf-8") as f:
+            test_data = json.load(f)
+    except FileNotFoundError:
+        print(f"Lỗi: Không tìm thấy file {test_file}.")
+        return
 
-    if combined_results:
-        best_combined_bm25 = combined_results[0][1]
-        mean_top3_combined_bm25 = (
-            sum(score for _, score in combined_results[:3])
-            / min(3, len(combined_results))
+    if len(test_data) != EXPECTED_QUESTIONS:
+        print(
+            f"Lỗi: de_thi.json có {len(test_data)} câu, cần {EXPECTED_QUESTIONS} câu.\n"
+            "Bạn đang dùng nhầm bộ đề (thường là de_thi.json 1000 câu ở thư mục gốc).\n"
+            "Hãy chạy: cd d:\\IR_Final\\Final && python baseline_v2.py"
         )
-    else:
-        best_combined_bm25 = 0.0
-        mean_top3_combined_bm25 = 0.0
-
-    # Đáp án riêng lẻ có được passage hỗ trợ hay không?
-    choice_support_scores = [
-        index.score_document(
-            query_tokens=choice_tokens,
-            document_id=passage_id
-        )
-        for passage_id in candidate_passage_ids
-    ]
-
-    best_choice_support = max(
-        choice_support_scores,
-        default=0.0
-    )
-
-    idf_overlap = calculate_idf_overlap(
-        index=index,
-        choice_tokens=choice_tokens,
-        passage_ids=candidate_passage_ids[:15]
-    )
-
-    exact_phrase = calculate_exact_phrase(
-        choice=choice,
-        passages=passages,
-        passage_ids=candidate_passage_ids[:15]
-    )
-
-    return {
-        "best_combined_bm25": best_combined_bm25,
-        "mean_top3_combined_bm25": mean_top3_combined_bm25,
-        "best_choice_support": best_choice_support,
-        "idf_overlap": idf_overlap,
-        "exact_phrase": exact_phrase
-    }
-
-
-# ============================================================
-# 6. RERANK A/B/C/D
-# ============================================================
-
-FEATURE_WEIGHTS = {
-    "best_combined_bm25": 0.30,
-    "mean_top3_combined_bm25": 0.20,
-    "best_choice_support": 0.20,
-    "idf_overlap": 0.20,
-    "exact_phrase": 0.10
-}
-
-
-def predict_answer(index, passages, item):
-    """
-    Truy xuất passage và chọn đáp án A/B/C/D.
-    """
-    question = str(item.get("question", ""))
-    choice_keys = ["A", "B", "C", "D"]
-
-    # Bước 1: retrieval bằng câu hỏi gốc.
-    question_results = index.search(
-        query=question,
-        top_k=QUESTION_TOP_K
-    )
-
-    question_passage_ids = [
-        passage_id
-        for passage_id, _ in question_results
-    ]
-
-    # Bước 2: tính feature riêng cho từng đáp án.
-    all_features = {}
-
-    for choice_key in choice_keys:
-        choice_text = str(item.get(choice_key, ""))
-
-        all_features[choice_key] = calculate_choice_features(
-            index=index,
-            passages=passages,
-            question=question,
-            choice=choice_text,
-            question_passage_ids=question_passage_ids
-        )
-
-    # Bước 3: chuẩn hóa từng feature giữa bốn đáp án.
-    normalized_features = {
-        choice_key: {}
-        for choice_key in choice_keys
-    }
-
-    for feature_name in FEATURE_WEIGHTS:
-        feature_values = [
-            all_features[choice_key][feature_name]
-            for choice_key in choice_keys
-        ]
-
-        normalized_values = min_max_normalize(feature_values)
-
-        for index_choice, choice_key in enumerate(choice_keys):
-            normalized_features[choice_key][feature_name] = (
-                normalized_values[index_choice]
-            )
-
-    # Bước 4: tính tổng điểm.
-    final_scores = {}
-
-    for choice_key in choice_keys:
-        final_scores[choice_key] = sum(
-            FEATURE_WEIGHTS[feature_name]
-            * normalized_features[choice_key][feature_name]
-            for feature_name in FEATURE_WEIGHTS
-        )
-
-    # Bước 5: nếu câu hỏi phủ định, chọn đáp án ít được hỗ trợ nhất.
-    if is_negative_question(question):
-        predicted_answer = min(
-            final_scores,
-            key=final_scores.get
-        )
-    else:
-        predicted_answer = max(
-            final_scores,
-            key=final_scores.get
-        )
-
-    debug_info = {
-        "negative_question": is_negative_question(question),
-        "scores": final_scores,
-        "features": all_features
-    }
-
-    return predicted_answer, debug_info
-
-
-# ============================================================
-# 7. SINH SUBMISSION
-# ============================================================
-
-def create_submission():
-    print("Đang đọc corpus...")
-    passages = load_passages(CORPUS_FILE)
-
-    if not passages:
-        raise ValueError("Corpus không có passage hợp lệ.")
-
-    print(f"Đã tạo {len(passages)} passage.")
-
-    index = BM25InvertedIndex(
-        texts=[
-            passage["text"]
-            for passage in passages
-        ],
-        k1=BM25_K1,
-        b=BM25_B
-    )
-
-    print("Đang đọc câu hỏi...")
-    test_data = read_json_or_jsonl(TEST_FILE)
-
-    if not test_data:
-        raise ValueError("Không đọc được dữ liệu đề thi.")
+        return
 
     submissions = []
-    debug_predictions = []
+    valid_choices = ["A", "B", "C", "D"]
+    total = len(test_data)
 
-    print(f"Bắt đầu dự đoán {len(test_data)} câu hỏi...")
-
-    for position, item in enumerate(test_data, start=1):
+    print("Bắt đầu truy xuất và dự đoán đáp án...")
+    # 4. Xử lý từng câu hỏi
+    for idx, item in enumerate(test_data, start=1):
         question_id = item.get("id")
+        question_text = item.get("question", "")
 
-        predicted_answer, debug_info = predict_answer(
-            index=index,
-            passages=passages,
-            item=item
+        # --- BƯỚC 4.1: RETRIEVAL (TF-IDF cosine) ---
+        question_norm = re.sub(r"\s+", " ", str(question_text or "").lower().strip())
+        top_doc_indices = retrieve_top_k_tfidf(
+            question_norm, vectorizer, doc_vectors, TOP_K
         )
+        top_doc_vectors = doc_vectors[top_doc_indices]
+        top_pool = [(doc_word_sets[i], documents[i]) for i in top_doc_indices]
 
-        submissions.append({
-            "id": question_id,
-            "answer": predicted_answer
-        })
+        # --- BƯỚC 4.2: CHỌN ĐÁP ÁN A/B/C/D ---
+        pick_lowest = is_negation_question(question_norm)
+        choice_scores = {}
+        choice_coverage = {}
+        choice_substring = {}
 
-        debug_predictions.append({
-            "id": question_id,
-            "answer": predicted_answer,
-            **debug_info
-        })
-
-        if position % 25 == 0 or position == len(test_data):
-            print(
-                f"Đã xử lý {position}/{len(test_data)} câu."
+        for choice_key in valid_choices:
+            choice_text = re.sub(
+                r"\s+", " ", str(item.get(choice_key, "")).lower().strip()
             )
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
-        json.dump(
-            submissions,
-            file,
-            ensure_ascii=False,
-            indent=2
+            hypothesis = f"{question_norm} {choice_text}".strip()
+            if not hypothesis:
+                continue
+
+            hypo_vector = vectorizer.transform([hypothesis])
+            hypo_words = set(tokenize(hypothesis))
+            choice_words = set(tokenize(choice_text))
+            cosine_scores = cosine_similarity(hypo_vector, top_doc_vectors).flatten()
+
+            choice_best = -1.0
+            max_coverage = 0.0
+            max_substring = 0.0
+            for i, (doc_words, doc_text) in enumerate(top_pool):
+                cosine = float(cosine_scores[i])
+                overlap = len(hypo_words & doc_words) / len(hypo_words) if hypo_words else 0.0
+                coverage = len(choice_words & doc_words) / len(choice_words) if choice_words else 0.0
+                substring = 1.0 if choice_text and choice_text in doc_text else 0.0
+
+                score = (
+                    W_COSINE * cosine
+                    + W_OVERLAP * overlap
+                    + W_COVERAGE * coverage
+                    + W_SUBSTRING * substring
+                )
+                choice_best = max(choice_best, score)
+                max_coverage = max(max_coverage, coverage)
+                max_substring = max(max_substring, substring)
+
+            if choice_best > -1.0:
+                choice_scores[choice_key] = choice_best
+                choice_coverage[choice_key] = max_coverage
+                choice_substring[choice_key] = max_substring
+
+        best_choice = pick_answer(
+            choice_scores, choice_coverage, choice_substring, pick_lowest
         )
 
-    # File debug giúp kiểm tra nếu kết quả chưa tốt.
-    with open("debug_predictions.json", "w", encoding="utf-8") as file:
-        json.dump(
-            debug_predictions,
-            file,
-            ensure_ascii=False,
-            indent=2
-        )
+        submissions.append({"id": question_id, "answer": best_choice})
 
-    # Zip cả code và file đáp án để tránh hệ thống chấm 0 điểm.
-    with zipfile.ZipFile(
-        ZIP_FILE,
-        "w",
-        zipfile.ZIP_DEFLATED
-    ) as zip_file:
-        zip_file.write(OUTPUT_FILE)
+        if idx % 20 == 0 or idx == total:
+            print(f"Đã xử lý {idx}/{total} câu")
 
-        current_code_file = Path(sys.argv[0])
+    # 5. Ghi submission.json (giống root)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(submissions, f, ensure_ascii=False, indent=2)
+    print(f"File kết quả: {output_file}")
 
-        if current_code_file.exists() and current_code_file.suffix == ".py":
-            zip_file.write(
-                current_code_file,
-                arcname="/content/IR_cuoiki.py"
-            )
-
-    print()
-    print("Đã hoàn thành.")
-    print(f"File đáp án: {OUTPUT_FILE}")
-    print(f"File debug: debug_predictions.json")
-    print(f"File nộp bài: {ZIP_FILE}")
+    # 6. Zip — [V2] thêm file .py vào zip để nộp bài
+    with zipfile.ZipFile(zip_file, "w", zipfile.ZIP_DEFLATED) as zipf:
+        zipf.write(output_file, arcname="submission.json")
+        zipf.write(__file__, arcname=os.path.basename(__file__))
+    print(f"File nộp: {zip_file}")
+    print(f"Đã xử lý xong {len(submissions)} câu.")
+    if len(submissions) != EXPECTED_QUESTIONS:
+        print(f"Lỗi: submission có {len(submissions)} câu, cần {EXPECTED_QUESTIONS}.")
+    else:
+        print("OK: submission.json đúng 765 câu — nộp file submission.zip trong thư mục Final/.")
 
 
 if __name__ == "__main__":
-    create_submission()
+    make_submission()

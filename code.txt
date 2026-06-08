@@ -235,3 +235,249 @@ def make_submission(
 
 if __name__ == "__main__":
     make_submission()
+
+# code moi 
+import json
+import re
+import os
+import zipfile
+import sys
+import codecs  # <--- BẮT BUỘC PHẢI IMPORT THƯ VIỆN NÀY
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+if sys.platform.startswith('win'):
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+# --- CẤU HÌNH SIÊU THAM SỐ (YÊU CẦU) ---
+CONFIG = {
+    "num_top_docs": 68,            
+    "weight_unigram": 1.0,      
+    "weight_bigram": 2.0,          
+    "weight_trigram": 3.0,         
+    
+    "score_exact_phrase": 30.0,    # Ưu tiên tuyệt đối việc khớp nguyên văn chuỗi
+    "score_full_number": 15.0,     # Khớp đủ số
+    "score_part_number": 3.0,      # Khớp một phần số
+    
+    "penalty_wrong_number": -15,  # Bộ lọc tử thần loại bỏ đáp án sai số
+}
+
+# Regex để trích xuất số (giữ nguyên định dạng gốc để so khớp chính xác)
+RE_NUMBERS = re.compile(r'\d+(?:\.\d+)?')
+
+def advanced_clean_text(text: str) -> str:
+    """
+    Làm sạch văn bản: chuyển thường, loại bỏ ký tự đặc biệt nhưng giữ số và khoảng trắng.
+    """
+    if not text:
+        return ""
+    text = text.lower()
+    # Giữ lại chữ cái, số và khoảng trắng
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    text = " ".join(text.split())
+    return text
+
+def load_corpus(corpus_file: str = "dataset.json"):
+    """
+    Đọc corpus, thực hiện TF-IDF Vectorization và lưu trữ các danh sách từ thô để tối ưu.
+    """
+    documents_raw = []
+    documents_clean = []
+    
+    try:
+        with open(corpus_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        for doc in data:
+            title = doc.get("title", "")
+            content = doc.get("content", "")
+            raw_text = f"{title} {content}"
+            clean_text = advanced_clean_text(raw_text)
+            
+            documents_raw.append(raw_text) # Dùng cho Exact Phrase (khớp chuỗi gốc)
+            documents_clean.append(clean_text) # Dùng cho TF-IDF và N-gram
+        
+        # Huấn luyện TF-IDF
+        vectorizer = TfidfVectorizer(
+            ngram_range=(1, 3), # Hỗ trợ 1-3 grams
+            stop_words='english' # Có thể thêm stop_words tiếng Việt nếu cần
+        )
+        doc_vectors = vectorizer.fit_transform(documents_clean)
+        
+        return documents_raw, documents_clean, vectorizer, doc_vectors
+        
+    except FileNotFoundError:
+        print(f"Lỗi: Không tìm thấy file {corpus_file}.")
+        return [], [], None, None
+    except Exception as e:
+        print(f"Lỗi khi xử lý corpus: {e}")
+        return [], [], None, None
+
+def make_submission(
+    test_file: str = "de_thi.json",
+    corpus_file: str = "dataset.json",
+    output_file: str = "submission.json",
+    zip_file: str = "submission.zip",
+):
+    # 1. Tải Corpus và Vectorizer
+    documents_raw, documents_clean, vectorizer, doc_vectors = load_corpus(corpus_file)
+    
+    if not documents_clean:
+        print("Không có dữ liệu corpus để xử lý.")
+        return
+
+    print(f"Đã tải {len(documents_clean)} tài liệu. Đang vector hóa...")
+    
+    # Đọc đề thi
+    try:
+        with open(test_file, "r", encoding="utf-8") as f:
+            test_data = json.load(f)
+    except FileNotFoundError:
+        print(f"Lỗi: Không tìm thấy file {test_file}.")    
+        return
+
+    submissions = []
+    valid_choices = ["A", "B", "C", "D"]
+
+    print("Bắt đầu chạy bộ Reader TỐC ĐỘ CỰC HẠN (Quick Access N-gram Set Lookup O(1))...")
+    
+    for item in test_data:
+        q_id = item.get("id")
+        q_text_raw = item.get("question", "")
+        q_text_clean = advanced_clean_text(q_text_raw)
+        
+        # --- RETRIEVAL: TF-IDF + Cosine ---
+        q_vector = vectorizer.transform([q_text_clean])
+        similarities = cosine_similarity(q_vector, doc_vectors).flatten()
+        # Lấy chỉ số của num_top_docs tài liệu có điểm cao nhất
+        top_indices = similarities.argsort()[-CONFIG["num_top_docs"]:][::-1]
+        
+        choices_data = {}
+        for choice_key in valid_choices:
+            choice_val = item.get(choice_key, "")
+            if not choice_val: continue
+            
+            choice_clean = advanced_clean_text(choice_val)
+            words = choice_clean.split()
+            if not words: continue
+            
+            # Chuẩn bị Bigram, Trigram, Numbers cho đáp án
+            bigrams = [" ".join(words[i:i+2]) for i in range(len(words)-1)]
+            trigrams = [" ".join(words[i:i+3]) for i in range(len(words)-2)]
+            numbers = RE_NUMBERS.findall(choice_val) # Tìm số trong chuỗi gốc
+            
+            choices_data[choice_key] = {
+                "raw_str": choice_val,
+                "clean_str": choice_clean,
+                "words": words, 
+                "bigrams": bigrams,
+                "trigrams": trigrams,
+                "numbers": numbers,
+                "max_local_score": -1e9
+            }
+        
+        # --- SCORING: Duyệt qua Top-K Documents ---
+        for doc_idx in top_indices:
+            doc_text_raw = documents_raw[doc_idx]
+            doc_text_clean = documents_clean[doc_idx]
+            doc_sim_score = similarities[doc_idx]
+            
+            # Quick Access Indexing cho Document hiện tại
+            doc_words = doc_text_clean.split()
+            doc_words_set = set(doc_words)
+            doc_bigrams_set = set(" ".join(doc_words[i:i+2]) for i in range(len(doc_words)-1))
+            doc_trigrams_set = set(" ".join(doc_words[i:i+3]) for i in range(len(doc_words)-2))
+            doc_numbers_set = set(RE_NUMBERS.findall(doc_text_raw))
+            
+            for choice_key, c_info in choices_data.items():
+                local_score = 0.0
+                
+                # 1. Unigram Scoring
+                local_score += sum(CONFIG["weight_unigram"] for w in c_info["words"] if w in doc_words_set)
+                
+                # 2. Bigram Scoring
+                local_score += sum(CONFIG["weight_bigram"] for bg in c_info["bigrams"] if bg in doc_bigrams_set)
+                
+                # 3. Trigram Scoring
+                local_score += sum(CONFIG["weight_trigram"] for tg in c_info["trigrams"] if tg in doc_trigrams_set)
+                
+                # 4. Exact Phrase Scoring (Khớp chuỗi nguyên văn trong doc gốc)
+                if c_info["raw_str"] in doc_text_raw:
+                    local_score += CONFIG["score_exact_phrase"]
+                
+                # 5. Number Matching Logic
+                if c_info["numbers"]:
+                    matched_count = sum(1 for num in c_info["numbers"] if num in doc_numbers_set)
+                    if matched_count == len(c_info["numbers"]): 
+                        local_score += CONFIG["score_full_number"]
+                    elif matched_count > 0: 
+                        local_score += (matched_count / len(c_info["numbers"])) * CONFIG["score_part_number"]
+                    else: 
+                        # Penalty tuyệt đối nếu có số trong đáp án nhưng không khớp trong doc
+                        local_score = CONFIG["penalty_wrong_number"]
+                
+                # 6. Cosine Weighting
+                # Chỉ áp dụng trọng số Cosine nếu local_score dương (tránh nhiễu)
+                if local_score > 0:
+                    final_local_score = local_score * doc_sim_score
+                else:
+                    final_local_score = local_score
+                
+                # Cập nhật điểm tối đa cho lựa chọn này
+                if final_local_score > c_info["max_local_score"]: 
+                    c_info["max_local_score"] = final_local_score
+
+        # --- FINAL SELECTION (HỖ TRỢ NHIỀU ĐÁP ÁN) ---
+        
+        # 1. Thu thập tất cả các điểm số tối đa đã tính được
+        scores_list = []
+        for choice_key, c_info in choices_data.items():
+            scores_list.append((choice_key, c_info["max_local_score"]))
+        
+        # Lưu ý: Nếu điểm cao nhất là -1e9 (bị phạt), ta vẫn dùng nó làm mốc so sánh
+        global_max_score = max(score for _, score in scores_list)
+        
+        # 3. Thiết lập ngưỡng (Threshold)
+        # Logic: Một đáp án được chọn nếu điểm của nó >= (global_max_score * ratio)
+        # Ví dụ: ratio = 0.9 -> chọn các đáp án có điểm >= 90% điểm của đáp án tốt nhất
+        ratio = 0.6 
+        
+        threshold_val = global_max_score * ratio
+        selected_choices = [k for k, s in scores_list if s >= threshold_val]
+
+        # 4. Đảm bảo luôn có ít nhất 1 đáp án (nếu không có cái nào vượt ngưỡng)
+        if not selected_choices:
+            selected_choices = [scores_list[0][0]] # Chọn cái có điểm cao nhất bất chấp
+
+        # Sắp xếp lại theo thứ tự A, B, C, D cho gọn
+        selected_choices.sort()
+
+        submissions.append({"id": q_id, "answer": selected_choices})
+
+    # --- OUTPUT ---
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(submissions, f, ensure_ascii=False, indent=2)
+
+    # Đóng gói ZIP
+    if os.path.exists(output_file):
+        with zipfile.ZipFile(zip_file, "w", zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(output_file, arcname=os.path.basename(output_file))
+            # Có thể thêm script hiện tại vào zip nếu muốn
+            script_name = os.path.basename(__file__)
+            if os.path.exists(script_name):
+                zipf.write(script_name, arcname=script_name)
+
+    print("===============================================================")
+    print(f"ĐÃ XỬ LÝ XONG! Tổng cộng {len(submissions)} câu hỏi.")
+    print(f"Kết quả nộp bài đã được lưu tại: {output_file}")
+    print(f"File ZIP đã sẵn sàng tại: {zip_file}")
+
+if __name__ == "__main__":
+    make_submission(
+        test_file=r"C:\Users\503\Downloads\de_thi.json",
+        corpus_file=r"C:\Users\503\Downloads\dataset.json",
+        output_file=r"C:\Users\503\Downloads\submission.json",
+        zip_file=r"C:\Users\503\Downloads\submission.zip"
+    )
